@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import os
 import re
 import secrets
 import sys
 import threading
+import time
+import uuid
 from contextlib import asynccontextmanager
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
 from camoufox.async_api import AsyncCamoufox
@@ -23,6 +26,8 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 DEFAULT_SERVICE_TOKEN = "dev-secret-change-me"
 DEFAULT_LOCALE = "en-CA"
 DEFAULT_TIMEZONE = "America/Toronto"
+logger = logging.getLogger("uvicorn.error")
+logger.setLevel(os.getenv("SCRAPER_LOG_LEVEL", "INFO").upper())
 BLOCKED_CONTENT_PATTERNS = (
     re.compile(r"access denied", re.IGNORECASE),
     re.compile(r"verify (?:that )?you are human", re.IGNORECASE),
@@ -30,6 +35,12 @@ BLOCKED_CONTENT_PATTERNS = (
     re.compile(r"captcha", re.IGNORECASE),
     re.compile(r"request blocked", re.IGNORECASE),
 )
+SECURITY_CHALLENGE_PATTERNS = (
+    re.compile(r"\bbm-verify\b", re.IGNORECASE),
+    re.compile(r"/_sec/verify", re.IGNORECASE),
+    re.compile(r"/interstitial/", re.IGNORECASE),
+)
+SECURITY_CHALLENGE_WAIT_MS = 6_000
 
 
 def positive_int_env(name: str, default: int) -> int:
@@ -49,6 +60,10 @@ def positive_int_env(name: str, default: int) -> int:
     return value
 
 
+# Defined after positive_int_env so invalid configuration fails at startup.
+SCRAPE_LOG_PREVIEW_CHARS = positive_int_env("SCRAPER_LOG_PREVIEW_CHARS", 500)
+
+
 class FetchRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -63,6 +78,9 @@ class FetchRequest(BaseModel):
     )
     locale: str = Field(default=DEFAULT_LOCALE, min_length=2, max_length=35)
     timezone: str = Field(default=DEFAULT_TIMEZONE, min_length=1, max_length=100)
+    wait_until: Literal["commit", "domcontentloaded"] = Field(
+        default="domcontentloaded", alias="waitUntil"
+    )
 
     @field_validator("allowed_hosts")
     @classmethod
@@ -112,9 +130,22 @@ class BrowserManager:
             if self._launcher is not None:
                 await self._launcher.__aexit__(None, None, None)
 
+            proxy_url = os.getenv("SCRAPER_PROXY_URL", "").strip()
+            launcher_options: dict[str, Any] = {
+                "headless": True,
+                "locale": DEFAULT_LOCALE,
+                "humanize": True,
+            }
+            if proxy_url:
+                launcher_options["proxy"] = {"server": proxy_url}
+                launcher_options["geoip"] = True
+
+            logger.info(
+                "Launching Camoufox proxy_enabled=%s humanize=true",
+                bool(proxy_url),
+            )
             launcher = AsyncCamoufox(
-                headless=True,
-                locale=DEFAULT_LOCALE,
+                **launcher_options,
             )
             self._launcher = launcher
 
@@ -147,7 +178,10 @@ class BrowserManager:
             self._browser = None
 
             if launcher is not None:
-                await launcher.__aexit__(None, None, None)
+                try:
+                    await launcher.__aexit__(None, None, None)
+                except Exception:
+                    logger.exception("Failed to close Camoufox cleanly")
 
 
 class BrowserRuntime:
@@ -301,10 +335,33 @@ def require_service_token(
 
 @app.post("/fetch", dependencies=[Depends(require_service_token)])
 async def fetch_product(payload: FetchRequest, request: Request):
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
+    started_at = time.monotonic()
+    target = safe_url_for_log(payload.url)
+    logger.info("Scrape started request_id=%s target=%s", request_id, target)
     async with request.app.state.semaphore:
         try:
-            return await request.app.state.browser_runtime.fetch(payload)
-        except ScraperError:
+            result = await request.app.state.browser_runtime.fetch(payload)
+            logger.info(
+                "Scrape completed request_id=%s target=%s final_url=%s duration_ms=%d html_bytes=%d",
+                request_id,
+                target,
+                safe_url_for_log(result["finalUrl"]),
+                round((time.monotonic() - started_at) * 1000),
+                len(result["html"].encode("utf-8")),
+            )
+            return result
+        except ScraperError as error:
+            logger.warning(
+                "Scrape failed request_id=%s target=%s code=%s status=%d duration_ms=%d message=%s cause=%r",
+                request_id,
+                target,
+                error.code,
+                error.status_code,
+                round((time.monotonic() - started_at) * 1000),
+                error.message,
+                error.__cause__,
+            )
             raise
         except BrowserNotInstalledError as error:
             raise ScraperError(
@@ -313,6 +370,12 @@ async def fetch_product(payload: FetchRequest, request: Request):
                 502,
             ) from error
         except Exception as error:
+            logger.exception(
+                "Unexpected scraper failure request_id=%s target=%s duration_ms=%d",
+                request_id,
+                target,
+                round((time.monotonic() - started_at) * 1000),
+            )
             raise ScraperError(
                 "UPSTREAM_FAILURE", "Scraper browser operation failed", 502
             ) from error
@@ -326,7 +389,9 @@ async def fetch_with_browser(browser: Any, payload: FetchRequest) -> dict[str, s
         context = await browser.new_context(
             locale=payload.locale,
             timezone_id=payload.timezone,
-            viewport={"width": 1365, "height": 900},
+            # Camoufox owns the fingerprint viewport. Playwright's default
+            # viewport includes `isMobile`, which Camoufox 0.4 rejects.
+            no_viewport=True,
             extra_http_headers={
                 "Accept-Language": f"{payload.locale},en;q=0.9"
             },
@@ -336,6 +401,17 @@ async def fetch_with_browser(browser: Any, payload: FetchRequest) -> dict[str, s
 
         page = await context.new_page()
         blocked_navigation: str | None = None
+        document_status: int | None = None
+
+        def record_response(response: Any) -> None:
+            nonlocal document_status
+            try:
+                if response.request.resource_type == "document":
+                    document_status = response.status
+            except Exception:
+                return
+
+        page.on("response", record_response)
 
         async def enforce_request_policy(route: Any) -> None:
             nonlocal blocked_navigation
@@ -362,7 +438,7 @@ async def fetch_with_browser(browser: Any, payload: FetchRequest) -> dict[str, s
         try:
             response = await page.goto(
                 requested_url,
-                wait_until="domcontentloaded",
+                wait_until=payload.wait_until,
                 timeout=payload.timeout_ms,
             )
         except PlaywrightError as error:
@@ -371,6 +447,12 @@ async def fetch_with_browser(browser: Any, payload: FetchRequest) -> dict[str, s
                     "INVALID_FINAL_URL",
                     "Retailer redirected to a disallowed URL",
                     422,
+                ) from error
+            if document_status in (403, 429):
+                raise ScraperError(
+                    "SOURCE_BLOCKED",
+                    f"Retailer returned HTTP {document_status}",
+                    502,
                 ) from error
             raise
 
@@ -394,7 +476,30 @@ async def fetch_with_browser(browser: Any, payload: FetchRequest) -> dict[str, s
             page.content(),
             visible_body_text(page),
         )
+
+        if is_security_challenge_html(html):
+            logger.info(
+                "Retailer security challenge detected target=%s; waiting %dms for verification",
+                safe_url_for_log(requested_url),
+                SECURITY_CHALLENGE_WAIT_MS,
+            )
+            await page.wait_for_timeout(SECURITY_CHALLENGE_WAIT_MS)
+            title, html, body_text = await asyncio.gather(
+                page.title(),
+                page.content(),
+                visible_body_text(page),
+            )
+
         final_url = page.url
+        logger.info(
+            "Scraped page target=%s final_url=%s title=%r html_bytes=%d visible_text_chars=%d body_preview=%r",
+            safe_url_for_log(requested_url),
+            safe_url_for_log(final_url),
+            log_preview(title),
+            len(html.encode("utf-8")),
+            len(body_text),
+            log_preview(body_text),
+        )
 
         if not is_allowed_url(final_url, payload.allowed_hosts):
             raise ScraperError(
@@ -410,7 +515,14 @@ async def fetch_with_browser(browser: Any, payload: FetchRequest) -> dict[str, s
                 422,
             )
 
-        if is_blocked_content(title, body_text):
+        if not re.search(r"<body\b", html, re.IGNORECASE):
+            raise ScraperError(
+                "SOURCE_BLOCKED",
+                "Retailer returned an incomplete page without product content",
+                502,
+            )
+
+        if is_blocked_content(title, body_text) or is_security_challenge_html(html):
             raise ScraperError(
                 "SOURCE_BLOCKED",
                 "Retailer displayed an access challenge",
@@ -460,6 +572,23 @@ def validate_requested_url(raw_url: str, allowed_hosts: list[str]) -> str:
         )
 
     return raw_url
+
+
+def safe_url_for_log(raw_url: str) -> str:
+    """Retain useful navigation context without logging query strings or fragments."""
+    try:
+        parsed = urlsplit(raw_url)
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    except ValueError:
+        return "<invalid-url>"
+
+
+def log_preview(value: str) -> str:
+    normalized = re.sub(r"\s+", " ", value).strip()
+    if len(normalized) <= SCRAPE_LOG_PREVIEW_CHARS:
+        return normalized
+
+    return f"{normalized[:SCRAPE_LOG_PREVIEW_CHARS]}…"
 
 
 def is_allowed_url(raw_url: str, allowed_hosts: list[str]) -> bool:
@@ -537,3 +666,8 @@ async def visible_body_text(page: Any) -> str:
 def is_blocked_content(title: str, body_text: str) -> bool:
     sample = f"{title}\n{body_text[:50_000]}"
     return any(pattern.search(sample) for pattern in BLOCKED_CONTENT_PATTERNS)
+
+
+def is_security_challenge_html(html: str) -> bool:
+    sample = html[:100_000]
+    return any(pattern.search(sample) for pattern in SECURITY_CHALLENGE_PATTERNS)

@@ -21,7 +21,7 @@ if __name__ == "__main__":
 
     uvicorn.run(
         "app.main:app",
-        host=os.getenv("SCRAPER_HOST", "127.0.0.1"),
+        host=os.getenv("SCRAPER_HOST", "0.0.0.0"),
         port=int(os.getenv("SCRAPER_PORT", "8000")),
         reload=env_flag("SCRAPER_RELOAD", True),
         reload_dirs=["app"],

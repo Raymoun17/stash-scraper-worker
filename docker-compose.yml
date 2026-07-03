@@ -3,9 +3,11 @@ services:
     build:
       context: .
       target: runtime
-    container_name: stash-scraper-worker
+    container_name: ${SCRAPER_CONTAINER_NAME:-stash-scraper-worker}
     restart: unless-stopped
     environment:
+      SCRAPER_HOST: ${SCRAPER_BIND_HOST:-0.0.0.0}
+      SCRAPER_PORT: ${SCRAPER_PORT:-8000}
       SCRAPER_SERVICE_TOKEN: ${SCRAPER_SERVICE_TOKEN:-stash-local-service-token}
       SCRAPER_MAX_CONCURRENCY: ${SCRAPER_MAX_CONCURRENCY:-2}
     healthcheck:
@@ -29,4 +31,4 @@ services:
 networks:
   stash-network:
     external: true
-    name: stash-network
+    name: ${NETWORK_NAME:-stash-network}

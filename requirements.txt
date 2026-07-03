@@ -1,3 +1,6 @@
 camoufox==0.4.11
+# Camoufox 0.4.11's patched Firefox protocol is incompatible with newer
+# Playwright drivers (1.61 crashes on Zara page errors and viewport setup).
+playwright==1.50.0
 fastapi==0.139.0
 uvicorn[standard]==0.35.0

@@ -63,7 +63,8 @@ Content-Type: application/json
   "waitAfterDomMs": 1500,
   "maxHtmlBytes": 10000000,
   "locale": "en-CA",
-  "timezone": "America/Toronto"
+  "timezone": "America/Toronto",
+  "waitUntil": "domcontentloaded"
 }
 ```
 
@@ -80,12 +81,23 @@ Errors use `{ "error": { "code", "message" } }` with one of
 | --- | --- | --- |
 | `SCRAPER_SERVICE_TOKEN` | `dev-secret-change-me` | Bearer token shared with the BFF. Set a strong secret outside local development. |
 | `SCRAPER_MAX_CONCURRENCY` | `2` | Maximum simultaneous isolated browser contexts. |
+| `SCRAPER_PROXY_URL` | unset | Optional HTTP/SOCKS proxy. When set, Camoufox aligns geo-IP data with the proxy. Recommended when a retailer blocks the server's egress IP. |
+| `SCRAPER_LOG_LEVEL` | `INFO` | Worker diagnostic log level. |
+| `SCRAPER_LOG_PREVIEW_CHARS` | `500` | Maximum normalized page-title/body characters included in scrape diagnostics. |
+
+The worker logs one structured line when each scrape starts and finishes. Failures
+include a request ID, sanitized target URL, duration, public error code, HTTP status,
+and the underlying browser exception. Supply `X-Request-ID` to correlate BFF and
+worker logs; otherwise the worker generates one. Query strings and proxy credentials
+are never written to these request logs. Successful navigation also logs the final
+URL, title, HTML byte count, visible-text character count, and a bounded visible-text
+preview; full HTML is not logged.
 
 ## Docker
 
-The repository-level `compose.yaml` is the recommended deployment. It builds
-the browser into the image, shares the service token with the BFF, and does not
-publish the worker port.
+The infrastructure repository at [c:\Dev\Projects\stash-infra](c:\Dev\Projects\stash-infra) is the recommended deployment path. It builds
+the browser into the image, shares the service token with the BFF, and keeps
+the worker on the private service network.
 
 ```powershell
 docker build -t stash-scraper-worker services/scraper-worker
@@ -94,14 +106,3 @@ docker run --init --env-file services/scraper-worker/.env -p 127.0.0.1:8000:8000
 
 Binding to loopback is suitable for local development. In production, expose
 the worker only to the BFF over a private service network.
-
-## Docker development with production parity
-
-Start `stash-db` first so the shared Docker network exists, then use:
-
-```bash
-docker compose up -d --watch
-```
-
-Editing a tracked project file rebuilds and recreates the production image.
-There are no source-code or `.env` bind mounts in the container.
