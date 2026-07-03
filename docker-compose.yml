@@ -1,0 +1,32 @@
+services:
+  scraper-worker:
+    build:
+      context: .
+      target: runtime
+    container_name: stash-scraper-worker
+    restart: unless-stopped
+    environment:
+      SCRAPER_SERVICE_TOKEN: ${SCRAPER_SERVICE_TOKEN:-stash-local-service-token}
+      SCRAPER_MAX_CONCURRENCY: ${SCRAPER_MAX_CONCURRENCY:-2}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks:
+      - stash-network
+    develop:
+      watch:
+        - action: rebuild
+          path: .
+          ignore:
+            - __pycache__/
+            - .venv/
+            - .git/
+            - .env*
+            - "*.pyc"
+
+networks:
+  stash-network:
+    external: true
+    name: stash-network

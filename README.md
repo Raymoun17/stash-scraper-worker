@@ -94,3 +94,14 @@ docker run --init --env-file services/scraper-worker/.env -p 127.0.0.1:8000:8000
 
 Binding to loopback is suitable for local development. In production, expose
 the worker only to the BFF over a private service network.
+
+## Docker development with production parity
+
+Start `stash-db` first so the shared Docker network exists, then use:
+
+```bash
+docker compose up -d --watch
+```
+
+Editing a tracked project file rebuilds and recreates the production image.
+There are no source-code or `.env` bind mounts in the container.
