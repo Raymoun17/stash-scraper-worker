@@ -1,7 +1,8 @@
 FROM python:3.12-slim-bookworm AS browser
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -26,10 +27,11 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m playwright install --with-deps chromium \
+    && chmod -R a+rx /ms-playwright
 
 RUN useradd --create-home --uid 10001 scraper
 USER scraper
-RUN python -m camoufox fetch
 
 FROM browser AS development
 

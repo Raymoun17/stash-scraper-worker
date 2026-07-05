@@ -27,7 +27,7 @@ if __name__ == "__main__":
         reload_dirs=["app"],
         env_file=env_file,
         # Uvicorn's Windows reload setup selects SelectorEventLoop, which
-        # cannot create the subprocess used by Playwright/Camoufox. Leaving
+        # cannot create the subprocess used by Playwright. Leaving
         # loop setup untouched preserves Python's ProactorEventLoop.
         loop="none" if sys.platform == "win32" else "auto",
     )
