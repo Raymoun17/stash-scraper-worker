@@ -9,6 +9,7 @@ services:
       SCRAPER_HOST: ${SCRAPER_BIND_HOST:-0.0.0.0}
       SCRAPER_PORT: ${SCRAPER_PORT:-8000}
       SCRAPER_SERVICE_TOKEN: ${SCRAPER_SERVICE_TOKEN:-stash-local-service-token}
+      SCRAPER_BACKEND: playwright-stealth
       SCRAPER_MAX_CONCURRENCY: ${SCRAPER_MAX_CONCURRENCY:-2}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]

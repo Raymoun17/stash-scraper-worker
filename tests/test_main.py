@@ -4,31 +4,11 @@ from app.main import (
     FetchRequest,
     ScraperError,
     fetch_with_browser,
-    is_security_challenge_html,
-    log_preview,
     safe_url_for_log,
 )
 
 
 PRODUCT_URL = "https://www2.hm.com/en_ca/productpage.1234567890.html"
-
-
-class FakeLocator:
-    def __init__(self, body_text: str = "Product details") -> None:
-        self.body_text = body_text
-
-    @property
-    def first(self):
-        return self
-
-    async def is_visible(self) -> bool:
-        return False
-
-    async def click(self, timeout: int) -> None:
-        del timeout
-
-    async def inner_text(self) -> str:
-        return self.body_text
 
 
 class FakePage:
@@ -49,15 +29,8 @@ class FakePage:
     async def wait_for_timeout(self, milliseconds: int) -> None:
         del milliseconds
 
-    async def title(self) -> str:
-        return "Product"
-
     async def content(self) -> str:
         return self.html
-
-    def locator(self, selector: str) -> FakeLocator:
-        del selector
-        return FakeLocator()
 
 
 class FakeContext:
@@ -111,16 +84,6 @@ class FetchWithBrowserTests(unittest.IsolatedAsyncioTestCase):
             PRODUCT_URL,
         )
 
-    def test_detects_zara_akamai_interstitial(self):
-        html = '<meta http-equiv="refresh" content="5; URL=\'?bm-verify=abc\'">' \
-            '<iframe src="/interstitial/ic.html"></iframe>' \
-            '<script>xhr.open("POST", "/_sec/verify")</script>'
-
-        self.assertTrue(is_security_challenge_html(html))
-
-    def test_log_preview_normalizes_whitespace(self):
-        self.assertEqual(log_preview("  Product\n  price: $59.90  "), "Product price: $59.90")
-
     async def test_rejects_oversized_html_and_closes_context(self):
         browser = FakeBrowser("<html></html>")
         payload = FetchRequest(
@@ -136,19 +99,20 @@ class FetchWithBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "HTML_TOO_LARGE")
         self.assertTrue(browser.context.closed)
 
-    async def test_rejects_incomplete_metadata_only_page(self):
-        browser = FakeBrowser("<html><head><title>Product</title></head></html>")
+    async def test_returns_metadata_only_page_for_downstream_extraction(self):
+        html = "<html><head><title>Product</title></head></html>"
+        browser = FakeBrowser(html)
         payload = FetchRequest(
             url=PRODUCT_URL,
             allowedHosts=["www2.hm.com"],
             waitAfterDomMs=0,
         )
 
-        with self.assertRaises(ScraperError) as raised:
-            await fetch_with_browser(browser, payload)
+        result = await fetch_with_browser(browser, payload)
 
-        self.assertEqual(raised.exception.code, "SOURCE_BLOCKED")
-        self.assertIn("incomplete page", raised.exception.message)
+        self.assertEqual(result["html"], html)
+        self.assertEqual(set(result), {"requestedUrl", "finalUrl", "html"})
+        self.assertTrue(browser.context.closed)
 
 
 if __name__ == "__main__":

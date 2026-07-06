@@ -4,23 +4,23 @@ import asyncio
 import ipaddress
 import logging
 import os
-import re
 import secrets
 import sys
 import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Protocol
 from urllib.parse import urlsplit
 
-from camoufox.async_api import AsyncCamoufox
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
+from playwright_stealth import Stealth
 
 
 DEFAULT_SERVICE_TOKEN = "dev-secret-change-me"
@@ -28,19 +28,6 @@ DEFAULT_LOCALE = "en-CA"
 DEFAULT_TIMEZONE = "America/Toronto"
 logger = logging.getLogger("uvicorn.error")
 logger.setLevel(os.getenv("SCRAPER_LOG_LEVEL", "INFO").upper())
-BLOCKED_CONTENT_PATTERNS = (
-    re.compile(r"access denied", re.IGNORECASE),
-    re.compile(r"verify (?:that )?you are human", re.IGNORECASE),
-    re.compile(r"unusual traffic", re.IGNORECASE),
-    re.compile(r"captcha", re.IGNORECASE),
-    re.compile(r"request blocked", re.IGNORECASE),
-)
-SECURITY_CHALLENGE_PATTERNS = (
-    re.compile(r"\bbm-verify\b", re.IGNORECASE),
-    re.compile(r"/_sec/verify", re.IGNORECASE),
-    re.compile(r"/interstitial/", re.IGNORECASE),
-)
-SECURITY_CHALLENGE_WAIT_MS = 6_000
 
 
 def positive_int_env(name: str, default: int) -> int:
@@ -58,10 +45,6 @@ def positive_int_env(name: str, default: int) -> int:
         raise RuntimeError(f"{name} must be greater than zero")
 
     return value
-
-
-# Defined after positive_int_env so invalid configuration fails at startup.
-SCRAPE_LOG_PREVIEW_CHARS = positive_int_env("SCRAPER_LOG_PREVIEW_CHARS", 500)
 
 
 class FetchRequest(BaseModel):
@@ -116,10 +99,59 @@ class BrowserNotInstalledError(RuntimeError):
     pass
 
 
+class BrowserBackend(Protocol):
+    name: str
+
+    async def launch(self) -> Any: ...
+
+    async def close(self) -> None: ...
+
+
+class PlaywrightStealthBackend:
+    name = "playwright-stealth"
+
+    def __init__(self) -> None:
+        self._launcher: Any | None = None
+
+    async def launch(self) -> Any:
+        proxy_url = os.getenv("SCRAPER_PROXY_URL", "").strip()
+        logger.info(
+            "Launching browser backend=%s proxy_enabled=%s",
+            self.name,
+            bool(proxy_url),
+        )
+        self._launcher = Stealth().use_async(async_playwright())
+        playwright = await self._launcher.__aenter__()
+        launch_options: dict[str, Any] = {"headless": True}
+        if proxy_url:
+            launch_options["proxy"] = {"server": proxy_url}
+        return await playwright.chromium.launch(**launch_options)
+
+    async def close(self) -> None:
+        launcher = self._launcher
+        self._launcher = None
+        if launcher is not None:
+            await launcher.__aexit__(None, None, None)
+
+
+BACKEND_FACTORIES = {
+    PlaywrightStealthBackend.name: PlaywrightStealthBackend,
+}
+
+
+def create_browser_backend() -> BrowserBackend:
+    name = os.getenv("SCRAPER_BACKEND", PlaywrightStealthBackend.name).strip().lower()
+    factory = BACKEND_FACTORIES.get(name)
+    if factory is None:
+        supported = ", ".join(sorted(BACKEND_FACTORIES))
+        raise RuntimeError(f"Unsupported SCRAPER_BACKEND '{name}'; expected: {supported}")
+    return factory()
+
+
 class BrowserManager:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
-        self._launcher: AsyncCamoufox | None = None
+        self._backend: BrowserBackend | None = None
         self._browser: Any | None = None
 
     async def get_browser(self) -> Any:
@@ -127,44 +159,26 @@ class BrowserManager:
             if self._browser is not None and self._browser.is_connected():
                 return self._browser
 
-            if self._launcher is not None:
-                await self._launcher.__aexit__(None, None, None)
+            if self._backend is not None:
+                await self._backend.close()
 
-            proxy_url = os.getenv("SCRAPER_PROXY_URL", "").strip()
-            launcher_options: dict[str, Any] = {
-                "headless": True,
-                "locale": DEFAULT_LOCALE,
-                "humanize": True,
-            }
-            if proxy_url:
-                launcher_options["proxy"] = {"server": proxy_url}
-                launcher_options["geoip"] = True
-
-            logger.info(
-                "Launching Camoufox proxy_enabled=%s humanize=true",
-                bool(proxy_url),
-            )
-            launcher = AsyncCamoufox(
-                **launcher_options,
-            )
-            self._launcher = launcher
+            backend = create_browser_backend()
+            self._backend = backend
 
             try:
-                self._browser = await launcher.__aenter__()
+                self._browser = await backend.launch()
             except Exception as error:
-                self._launcher = None
+                self._backend = None
                 self._browser = None
 
                 try:
-                    await launcher.__aexit__(
-                        type(error), error, error.__traceback__
-                    )
+                    await backend.close()
                 except Exception:
                     pass
 
                 if "executable doesn't exist" in str(error).lower():
                     raise BrowserNotInstalledError(
-                        "Camoufox browser is not installed"
+                        f"{backend.name} browser is not installed"
                     ) from error
 
                 raise
@@ -173,15 +187,15 @@ class BrowserManager:
 
     async def close(self) -> None:
         async with self._lock:
-            launcher = self._launcher
-            self._launcher = None
+            backend = self._backend
+            self._backend = None
             self._browser = None
 
-            if launcher is not None:
+            if backend is not None:
                 try:
-                    await launcher.__aexit__(None, None, None)
+                    await backend.close()
                 except Exception:
-                    logger.exception("Failed to close Camoufox cleanly")
+                    logger.exception("Failed to close browser backend cleanly")
 
 
 class BrowserRuntime:
@@ -198,25 +212,35 @@ class BrowserRuntime:
     async def start(self) -> None:
         if not self._threaded:
             self._manager = BrowserManager()
+            await self._manager.get_browser()
             return
 
         self._thread = threading.Thread(
             target=self._run_windows_loop,
-            name="camoufox-proactor",
+            name="scraper-browser-proactor",
             daemon=True,
         )
         self._thread.start()
         await asyncio.to_thread(self._ready.wait)
 
         if self._startup_error is not None:
-            raise RuntimeError("Failed to start the Camoufox event loop") from self._startup_error
+            raise RuntimeError("Failed to start the browser event loop") from self._startup_error
+
+        if self._loop is None or self._manager is None:
+            raise RuntimeError("Browser event loop did not initialize")
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._manager.get_browser(),
+            self._loop,
+        )
+        await asyncio.wrap_future(future)
 
     async def fetch(self, payload: FetchRequest) -> dict[str, str]:
         if not self._threaded:
             return await self._fetch_on_browser_loop(payload)
 
         if self._loop is None:
-            raise RuntimeError("Camoufox event loop is not running")
+            raise RuntimeError("Browser event loop is not running")
 
         future = asyncio.run_coroutine_threadsafe(
             self._fetch_on_browser_loop(payload),
@@ -250,7 +274,7 @@ class BrowserRuntime:
         self, payload: FetchRequest
     ) -> dict[str, str]:
         if self._manager is None:
-            raise RuntimeError("Camoufox browser manager is not initialized")
+            raise RuntimeError("Browser manager is not initialized")
 
         browser = await self._manager.get_browser()
         return await fetch_with_browser(browser, payload)
@@ -366,7 +390,7 @@ async def fetch_product(payload: FetchRequest, request: Request):
         except BrowserNotInstalledError as error:
             raise ScraperError(
                 "UPSTREAM_FAILURE",
-                "Camoufox browser is not installed; run `python -m camoufox fetch`",
+                f"{error}; install the selected browser binary",
                 502,
             ) from error
         except Exception as error:
@@ -389,8 +413,6 @@ async def fetch_with_browser(browser: Any, payload: FetchRequest) -> dict[str, s
         context = await browser.new_context(
             locale=payload.locale,
             timezone_id=payload.timezone,
-            # Camoufox owns the fingerprint viewport. Playwright's default
-            # viewport includes `isMobile`, which Camoufox 0.4 rejects.
             no_viewport=True,
             extra_http_headers={
                 "Accept-Language": f"{payload.locale},en;q=0.9"
@@ -468,37 +490,15 @@ async def fetch_with_browser(browser: Any, payload: FetchRequest) -> dict[str, s
                 "UPSTREAM_FAILURE", f"Retailer returned HTTP {status}", 502
             )
 
-        await dismiss_consent(page)
         await page.wait_for_timeout(payload.wait_after_dom_ms)
-
-        title, html, body_text = await asyncio.gather(
-            page.title(),
-            page.content(),
-            visible_body_text(page),
-        )
-
-        if is_security_challenge_html(html):
-            logger.info(
-                "Retailer security challenge detected target=%s; waiting %dms for verification",
-                safe_url_for_log(requested_url),
-                SECURITY_CHALLENGE_WAIT_MS,
-            )
-            await page.wait_for_timeout(SECURITY_CHALLENGE_WAIT_MS)
-            title, html, body_text = await asyncio.gather(
-                page.title(),
-                page.content(),
-                visible_body_text(page),
-            )
+        html = await page.content()
 
         final_url = page.url
         logger.info(
-            "Scraped page target=%s final_url=%s title=%r html_bytes=%d visible_text_chars=%d body_preview=%r",
+            "Scraped page target=%s final_url=%s html_bytes=%d",
             safe_url_for_log(requested_url),
             safe_url_for_log(final_url),
-            log_preview(title),
             len(html.encode("utf-8")),
-            len(body_text),
-            log_preview(body_text),
         )
 
         if not is_allowed_url(final_url, payload.allowed_hosts):
@@ -515,26 +515,10 @@ async def fetch_with_browser(browser: Any, payload: FetchRequest) -> dict[str, s
                 422,
             )
 
-        if not re.search(r"<body\b", html, re.IGNORECASE):
-            raise ScraperError(
-                "SOURCE_BLOCKED",
-                "Retailer returned an incomplete page without product content",
-                502,
-            )
-
-        if is_blocked_content(title, body_text) or is_security_challenge_html(html):
-            raise ScraperError(
-                "SOURCE_BLOCKED",
-                "Retailer displayed an access challenge",
-                502,
-            )
-
         return {
             "requestedUrl": requested_url,
             "finalUrl": final_url,
-            "title": title,
             "html": html,
-            "bodyText": body_text,
         }
     except ScraperError:
         raise
@@ -583,14 +567,6 @@ def safe_url_for_log(raw_url: str) -> str:
         return "<invalid-url>"
 
 
-def log_preview(value: str) -> str:
-    normalized = re.sub(r"\s+", " ", value).strip()
-    if len(normalized) <= SCRAPE_LOG_PREVIEW_CHARS:
-        return normalized
-
-    return f"{normalized[:SCRAPE_LOG_PREVIEW_CHARS]}…"
-
-
 def is_allowed_url(raw_url: str, allowed_hosts: list[str]) -> bool:
     try:
         parsed = urlsplit(raw_url)
@@ -635,39 +611,3 @@ def is_private_network_url(raw_url: str) -> bool:
         return False
 
     return not address.is_global
-
-
-async def dismiss_consent(page: Any) -> None:
-    selectors = (
-        "#onetrust-accept-btn-handler",
-        "button[id*='accept']",
-        "button:has-text('Accept all')",
-        "button:has-text('Accept All')",
-    )
-
-    for selector in selectors:
-        button = page.locator(selector).first
-
-        try:
-            if await button.is_visible():
-                await button.click(timeout=1_000)
-                return
-        except PlaywrightError:
-            continue
-
-
-async def visible_body_text(page: Any) -> str:
-    try:
-        return await page.locator("body").inner_text()
-    except PlaywrightError:
-        return ""
-
-
-def is_blocked_content(title: str, body_text: str) -> bool:
-    sample = f"{title}\n{body_text[:50_000]}"
-    return any(pattern.search(sample) for pattern in BLOCKED_CONTENT_PATTERNS)
-
-
-def is_security_challenge_html(html: str) -> bool:
-    sample = html[:100_000]
-    return any(pattern.search(sample) for pattern in SECURITY_CHALLENGE_PATTERNS)
